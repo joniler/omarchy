@@ -442,7 +442,9 @@ ShellRoot {
     return api
   }
 
-  function pluginAppLibraryFor(cacheKey, pluginId) {
+  // `mayUse` is the owning facade's call-time capability check: these helpers
+  // are handed out and retained, so revoking the facade must also disarm them.
+  function pluginAppLibraryFor(cacheKey, pluginId, mayUse) {
     if (_pluginAppLibraryApis[cacheKey]) return _pluginAppLibraryApis[cacheKey]
     var api = shell.createPluginApi(pluginAppLibraryApiComponent,
       { ownerPluginId: pluginId },
@@ -452,8 +454,8 @@ ShellRoot {
         _sortedEntries: function(query) { return shell.appLibrary.sortedEntries(query) },
         _iconSource: function(icon) { return shell.appLibrary.iconSource(icon) },
         _refreshIcons: function() { shell.appLibrary.refreshIcons() },
-        _launch: function(desktopId, name) { shell.appLibrary.launch(desktopId, name) },
-        _remove: function(desktopId, name) { shell.appLibrary.remove(desktopId, name) }
+        _launch: function(desktopId, name) { if (mayUse()) shell.appLibrary.launch(desktopId, name) },
+        _remove: function(desktopId, name) { if (mayUse()) shell.appLibrary.remove(desktopId, name) }
       })
     if (!api) return null
     var next = ({})
@@ -478,7 +480,7 @@ ShellRoot {
     return api
   }
 
-  function pluginFirstPartyServiceFor(cacheKey, pluginId, requestedId) {
+  function pluginFirstPartyServiceFor(cacheKey, pluginId, requestedId, mayUse) {
     var id = String(requestedId || "")
     var allowed = ["omarchy.idle", "omarchy.media", "omarchy.nightlight", "omarchy.notifications"]
     if (allowed.indexOf(id) === -1) return null
@@ -488,23 +490,26 @@ ShellRoot {
     function service() {
       return shell.serviceFor(shell.pluginRegistry.resolveEnabledId(id))
     }
+    function controlledService() {
+      return mayUse() ? service() : null
+    }
     var api = shell.createPluginApi(pluginFirstPartyServiceApiComponent,
       { ownerPluginId: pluginId, serviceId: id },
       {
         _setIdleEnabled: function(value) {
-          var target = service()
+          var target = controlledService()
           if (target && typeof target.setIdleEnabled === "function") target.setIdleEnabled(value)
         },
         _setNightlight: function(value) {
-          var target = service()
+          var target = controlledService()
           if (target && typeof target.setNightlight === "function") target.setNightlight(value)
         },
         _setDoNotDisturb: function(value) {
-          var target = service()
+          var target = controlledService()
           if (target && typeof target.setDoNotDisturb === "function") target.setDoNotDisturb(value)
         },
         _runAction: function(action, showFeedback, targetKey) {
-          var target = service()
+          var target = controlledService()
           if (target && typeof target.runAction === "function") target.runAction(action, showFeedback, targetKey)
         },
         _playerKey: function(player) {
@@ -512,7 +517,7 @@ ShellRoot {
           return target && typeof target.playerKey === "function" ? target.playerKey(player) : ""
         },
         _selectPlayer: function(playerKey) {
-          var target = service()
+          var target = controlledService()
           if (target && typeof target.selectPlayer === "function") target.selectPlayer(playerKey)
         }
       })
@@ -602,6 +607,10 @@ ShellRoot {
       return barCapabilities && shell.pluginHasBarCapabilities(currentManifest())
     }
 
+    function hasCurrentMenu() {
+      return shell.manifestHasKind(currentManifest(), "menu")
+    }
+
     // Construct the narrow service proxies before any plugin binding can call
     // firstPartyServiceFor(). Creating a QObject while evaluating that binding
     // makes QML re-enter the binding and report a loop on the caller's service
@@ -611,7 +620,7 @@ ShellRoot {
       var serviceIds = ["omarchy.idle", "omarchy.media", "omarchy.nightlight", "omarchy.notifications"]
       for (var i = 0; i < serviceIds.length; i++) {
         var serviceId = serviceIds[i]
-        firstPartyServices[serviceId] = shell.pluginFirstPartyServiceFor(cacheKey, key, serviceId)
+        firstPartyServices[serviceId] = shell.pluginFirstPartyServiceFor(cacheKey, key, serviceId, hasCurrentBarCapabilities)
       }
     }
 
@@ -619,7 +628,7 @@ ShellRoot {
       { pluginId: key },
       {
         appLibrary: shell.manifestHasKind(manifest, "menu")
-          ? shell.pluginAppLibraryFor(cacheKey, key) : null,
+          ? shell.pluginAppLibraryFor(cacheKey, key, hasCurrentMenu) : null,
         bar: shell.pluginBarStateFor(cacheKey, key),
         barConfig: shell.publicBarConfig(),
         idleConfig: shell.publicIdleConfigFor(manifest),
@@ -633,7 +642,7 @@ ShellRoot {
         },
         _barEntryShellLookup: function(ownerId, moduleName) {
           return hasCurrentBarCapabilities()
-            ? shell.pluginShellForBarEntry(cacheKey + ":" + ownerId, moduleName) : null
+            ? shell.pluginShellForBarEntry(cacheKey + ":" + ownerId, moduleName, hasCurrentBarCapabilities) : null
         },
         _summon: function(requestedId, payloadJson) {
           if (!shell.pluginOwnsTarget(key, requestedId)
@@ -696,7 +705,7 @@ ShellRoot {
     return shell.scopedPluginShellForId(pluginId)
   }
 
-  function pluginShellForBarEntry(ownerId, moduleName) {
+  function pluginShellForBarEntry(ownerId, moduleName, mayUse) {
     var owner = String(ownerId || "")
     var target = String(moduleName || "")
     if (!owner || !target) return null
@@ -704,7 +713,13 @@ ShellRoot {
     var cacheKey = owner + "::" + target
     if (_pluginBarEntryShellApis[cacheKey]) return _pluginBarEntryShellApis[cacheKey]
 
+    // The first-party bar asks with no check of its own; a scoped facade passes one.
+    function permitted() {
+      return typeof mayUse !== "function" || mayUse()
+    }
+
     function owns(requestedId) {
+      if (!permitted()) return false
       return shell.pluginRegistry.resolveEnabledId(String(requestedId || ""))
         === shell.pluginRegistry.resolveEnabledId(target)
     }
@@ -736,7 +751,7 @@ ShellRoot {
             ? shell.isPluginOpen(shell.pluginRegistry.resolveEnabledId(target)) : false
         },
         _updateSettings: function(requestedId, settings) {
-          return String(requestedId || "") === target
+          return permitted() && String(requestedId || "") === target
             ? shell.updateEntryInline(target, settings) : false
         }
       })
